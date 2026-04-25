@@ -1,15 +1,43 @@
 import os
 from datetime import datetime, timezone
+from urllib.parse import urlencode
 
 from bson import ObjectId
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from google.auth.transport.requests import Request as FirebaseRequestAdapter
 from google.oauth2 import id_token
 from pymongo import ASCENDING, MongoClient
 from pymongo.errors import DuplicateKeyError
+from starlette import status
+
+
+# ---------- small helpers ----------
+def utcNow():
+    return datetime.now(timezone.utc)
+
+
+def parseObjectId(value):
+    if not value:
+        return None
+    try:
+        return ObjectId(value)
+    except Exception:
+        return None
+
+
+def goHome(directory_id=None, message=None, error=None):
+    params = {}
+    if directory_id:
+        params["directory_id"] = directory_id
+    if message:
+        params["message"] = message
+    if error:
+        params["error"] = error
+    url = "/?" + urlencode(params) if params else "/"
+    return RedirectResponse(url=url, status_code=status.HTTP_302_FOUND)
 
 
 # ---------- config ----------
@@ -65,7 +93,7 @@ def getUser(user_token):
     if user is not None:
         return user
 
-    now = datetime.now(timezone.utc)
+    now = utcNow()
     root_id = ObjectId()
     try:
         users.insert_one({
