@@ -2,6 +2,7 @@ import os
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 
+from azure.storage.blob import BlobServiceClient
 from bson import ObjectId
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -47,6 +48,14 @@ DEFAULT_MONGODB_URI = (
 )
 MONGODB_URI = os.environ.get("MONGODB_URI") or DEFAULT_MONGODB_URI
 DATABASE_NAME = os.environ.get("MONGODB_DATABASE", "dropbox_assignment")
+DEFAULT_AZURITE = (
+    "DefaultEndpointsProtocol=http;"
+    "AccountName=devstoreaccount1;"
+    "AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;"
+    "BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+)
+AZURE_CONN = os.environ.get("AZURE_STORAGE_CONNECTION_STRING", DEFAULT_AZURITE)
+CONTAINER_NAME = os.environ.get("AZURE_STORAGE_CONTAINER", "dropbox-files")
 
 
 # ---------- FastAPI ----------
@@ -72,6 +81,13 @@ files.create_index(
     [("owner_user_id", ASCENDING), ("directory_id", ASCENDING), ("name", ASCENDING)],
     unique=True,
 )
+
+
+# ---------- Azurite blob ----------
+blob_service = BlobServiceClient.from_connection_string(
+    AZURE_CONN, connection_timeout=2, read_timeout=2, retry_total=1,
+)
+container = blob_service.get_container_client(CONTAINER_NAME)
 
 
 def validateFirebaseToken(request):
