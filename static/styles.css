@@ -1,2 +1,77 @@
-body { font-family: Arial, Helvetica, sans-serif; }
-.main { width: 90%; max-width: 900px; margin: 20px auto; }
+body {
+    font-family: Arial, Helvetica, sans-serif;
+    background-color: #f4f4f4;
+    color: #222222;
+    margin: 0;
+    text-align: center;
+}
+
+.main {
+    width: 90%;
+    max-width: 900px;
+    margin: 20px auto;
+}
+
+.box {
+    background-color: #ffffff;
+    border: 1px solid #cfcfcf;
+    padding: 18px;
+    margin-bottom: 18px;
+}
+
+h1, h2, p {
+    margin-top: 0;
+}
+
+.simple-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+.simple-list li {
+    border: 1px solid #dddddd;
+    background-color: #fafafa;
+    padding: 12px;
+    margin-bottom: 10px;
+}
+
+.button-row {
+    display: flex;
+    gap: 8px;
+    justify-content: center;
+    align-items: center;
+    flex-wrap: wrap;
+    margin: 8px 0;
+}
+
+form {
+    margin: 8px 0;
+}
+
+input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 8px;
+    margin-bottom: 8px;
+    border: 1px solid #bdbdbd;
+}
+
+button {
+    padding: 8px 12px;
+    border: 1px solid #9d9d9d;
+    background-color: #eeeeee;
+    cursor: pointer;
+}
+
+a {
+    color: #0b57a4;
+}
+
+.error {
+    background-color: #ffeaea;
+}
+
+.success {
+    background-color: #eef8ee;
+}

@@ -4,3 +4,4 @@ jinja2
 google-auth
 pymongo
 azure-storage-blob
+python-multipart

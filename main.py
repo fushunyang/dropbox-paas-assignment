@@ -2,9 +2,10 @@ import os
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 
-from azure.storage.blob import BlobServiceClient
+from azure.core.exceptions import ResourceExistsError
+from azure.storage.blob import BlobServiceClient, ContentSettings
 from bson import ObjectId
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -13,32 +14,6 @@ from google.oauth2 import id_token
 from pymongo import ASCENDING, MongoClient
 from pymongo.errors import DuplicateKeyError
 from starlette import status
-
-
-# ---------- small helpers ----------
-def utcNow():
-    return datetime.now(timezone.utc)
-
-
-def parseObjectId(value):
-    if not value:
-        return None
-    try:
-        return ObjectId(value)
-    except Exception:
-        return None
-
-
-def goHome(directory_id=None, message=None, error=None):
-    params = {}
-    if directory_id:
-        params["directory_id"] = directory_id
-    if message:
-        params["message"] = message
-    if error:
-        params["error"] = error
-    url = "/?" + urlencode(params) if params else "/"
-    return RedirectResponse(url=url, status_code=status.HTTP_302_FOUND)
 
 
 # ---------- config ----------
@@ -63,6 +38,43 @@ app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 firebaseRequestAdapter = FirebaseRequestAdapter()
+
+
+# ---------- small helpers ----------
+def utcNow():
+    return datetime.now(timezone.utc)
+
+
+def formatSize(size):
+    if size is None:
+        return "-"
+    value = float(size)
+    for unit in ["B", "KB", "MB", "GB"]:
+        if value < 1024 or unit == "GB":
+            return f"{int(value)} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{size} B"
+
+
+def parseObjectId(value):
+    if not value:
+        return None
+    try:
+        return ObjectId(value)
+    except Exception:
+        return None
+
+
+def goHome(directory_id=None, message=None, error=None):
+    params = {}
+    if directory_id:
+        params["directory_id"] = directory_id
+    if message:
+        params["message"] = message
+    if error:
+        params["error"] = error
+    url = "/?" + urlencode(params) if params else "/"
+    return RedirectResponse(url=url, status_code=status.HTTP_302_FOUND)
 
 
 # ---------- MongoDB ----------
@@ -125,10 +137,134 @@ def getUser(user_token):
     return users.find_one({"user_id": fb_uid})
 
 
+def getCurrentDirectory(user, directory_id_text):
+    root = directories.find_one({"_id": user["root_directory_id"], "owner_user_id": user["user_id"]})
+    if root is None:
+        return None
+    if not directory_id_text:
+        return root
+    target = directories.find_one(
+        {"_id": parseObjectId(directory_id_text), "owner_user_id": user["user_id"]}
+    )
+    return target or root
+
+
+def buildContext(request, user_token=None, user=None, current=None, message=None, error=None):
+    ctx = {
+        "request": request, "user_token": user_token,
+        "current_directory": None, "directories": [], "files": [],
+        "existing_file_names": [],
+        "message": message, "error": error,
+    }
+    if user is None or current is None:
+        return ctx
+    sub_dirs = list(directories.find(
+        {"owner_user_id": user["user_id"], "parent_directory_id": current["_id"]}
+    ).sort("name", ASCENDING))
+    cur_files = list(files.find(
+        {"owner_user_id": user["user_id"], "directory_id": current["_id"]}
+    ).sort("name", ASCENDING))
+    ctx["current_directory"] = {
+        "id": str(current["_id"]), "name": current["name"], "path": current["path"],
+    }
+    ctx["directories"] = [
+        {"id": str(d["_id"]), "name": d["name"], "path": d["path"]} for d in sub_dirs
+    ]
+    ctx["files"] = [{
+        "id": str(f["_id"]), "name": f["name"], "size": formatSize(f.get("size")),
+    } for f in cur_files]
+    ctx["existing_file_names"] = [f["name"] for f in cur_files]
+    return ctx
+
+
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request):
+    msg = request.query_params.get("message")
+    err = request.query_params.get("error")
     token = validateFirebaseToken(request)
-    user = getUser(token) if token else None
-    return templates.TemplateResponse(request, "main.html", {
-        "request": request, "user_token": token, "user": user,
-    })
+    if token is None:
+        return templates.TemplateResponse(request, "main.html", buildContext(request, message=msg, error=err))
+    user = getUser(token)
+    current = getCurrentDirectory(user, request.query_params.get("directory_id"))
+    return templates.TemplateResponse(request, "main.html", buildContext(
+        request, user_token=token, user=user, current=current, message=msg, error=err,
+    ))
+
+
+@app.post("/create-directory")
+async def createDirectory(request: Request,
+                          current_directory_id: str = Form(...),
+                          directory_name: str = Form(...)):
+    token = validateFirebaseToken(request)
+    if token is None:
+        return goHome(error="Please sign in before creating a directory.")
+    user = getUser(token)
+    current = directories.find_one(
+        {"_id": parseObjectId(current_directory_id), "owner_user_id": user["user_id"]}
+    )
+    if current is None:
+        return goHome(error="The target directory could not be found.")
+    name = (directory_name or "").strip()
+    if not name or name in [".", "..", "/"] or "/" in name or "\\" in name:
+        return goHome(current_directory_id, error="Please choose a normal directory name.")
+    new_path = f"/{name}" if current["path"] == "/" else f"{current['path']}/{name}"
+    try:
+        directories.insert_one({
+            "owner_user_id": user["user_id"], "name": name,
+            "parent_directory_id": current["_id"], "path": new_path,
+            "created_at": utcNow(),
+        })
+    except DuplicateKeyError:
+        return goHome(current_directory_id, error="A directory with that name already exists here.")
+    return goHome(current_directory_id, message=f"Directory '{name}' created.")
+
+
+@app.post("/upload-file")
+async def uploadFile(request: Request,
+                     current_directory_id: str = Form(...),
+                     overwrite: str = Form("0"),
+                     upload: UploadFile = File(...)):
+    token = validateFirebaseToken(request)
+    if token is None:
+        return goHome(error="Please sign in before uploading files.")
+    user = getUser(token)
+    current = directories.find_one(
+        {"_id": parseObjectId(current_directory_id), "owner_user_id": user["user_id"]}
+    )
+    if current is None:
+        return goHome(error="The target directory could not be found.")
+    filename = (upload.filename or "").strip()
+    if not filename:
+        return goHome(current_directory_id, error="Please choose a file first.")
+    existing = files.find_one(
+        {"owner_user_id": user["user_id"], "directory_id": current["_id"], "name": filename}
+    )
+    if existing is not None and overwrite != "1":
+        return goHome(current_directory_id, error="That filename already exists. Confirm overwrite.")
+
+    content = await upload.read()
+    blob_name = f"{user['user_id']}/{current['_id']}/{filename}"
+    try:
+        try:
+            container.create_container()
+        except ResourceExistsError:
+            pass
+        container.get_blob_client(blob_name).upload_blob(
+            content, overwrite=True,
+            content_settings=ContentSettings(content_type=upload.content_type or "application/octet-stream"),
+        )
+    except Exception:
+        return goHome(current_directory_id, error="Blob storage upload failed. Check Azurite.")
+
+    fields = {
+        "name": filename, "owner_user_id": user["user_id"],
+        "directory_id": current["_id"], "directory_path": current["path"],
+        "blob_name": blob_name, "size": len(content),
+        "content_type": upload.content_type or "application/octet-stream",
+        "updated_at": utcNow(),
+    }
+    if existing is None:
+        files.insert_one({**fields, "created_at": utcNow()})
+        return goHome(current_directory_id, message=f"Uploaded '{filename}'.")
+    files.update_one({"_id": existing["_id"]}, {"$set": fields})
+    return goHome(current_directory_id, message=f"Overwrote '{filename}'.")

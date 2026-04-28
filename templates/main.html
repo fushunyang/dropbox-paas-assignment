@@ -10,10 +10,74 @@
     <div class="main">
         <div class="box">
             <h1>Dropbox Assignment</h1>
-            {% if user_token %}
-            <p>Signed in as {{ user_token.email }}.</p>
+        </div>
+
+        {% if error %}
+        <div class="box error"><p>{{ error }}</p></div>
+        {% endif %}
+        {% if message %}
+        <div class="box success"><p>{{ message }}</p></div>
+        {% endif %}
+
+        {% if user_token %}
+        <div class="box">
+            <h2>User</h2>
+            <p>Current directory: {{ current_directory.path }}</p>
             <button id="sign-out" type="button">Sign Out</button>
+        </div>
+
+        <div class="box">
+            <h2>Create Directory</h2>
+            <form action="/create-directory" method="post">
+                <input type="hidden" name="current_directory_id" value="{{ current_directory.id }}">
+                <input type="text" name="directory_name" placeholder="new-folder-name">
+                <button type="submit">Create Directory</button>
+            </form>
+        </div>
+
+        <div class="box">
+            <h2>Upload File</h2>
+            <form id="upload-form" action="/upload-file" method="post" enctype="multipart/form-data">
+                <input type="hidden" name="current_directory_id" value="{{ current_directory.id }}">
+                <input type="hidden" id="overwrite" name="overwrite" value="0">
+                <input type="file" id="upload" name="upload">
+                <button type="submit">Upload File</button>
+            </form>
+        </div>
+
+        <div class="box">
+            <h2>Directories</h2>
+            {% if directories %}
+            <ul class="simple-list">
+                {% for directory in directories %}
+                <li>
+                    <p><strong>{{ directory.name }}/</strong></p>
+                    <a href="/?directory_id={{ directory.id }}">Open</a>
+                </li>
+                {% endfor %}
+            </ul>
             {% else %}
+            <p>No directories in this location.</p>
+            {% endif %}
+        </div>
+
+        <div class="box">
+            <h2>Files</h2>
+            {% if files %}
+            <ul class="simple-list">
+                {% for file in files %}
+                <li>
+                    <p><strong>{{ file.name }}</strong> ({{ file.size }})</p>
+                </li>
+                {% endfor %}
+            </ul>
+            {% else %}
+            <p>No files in this location.</p>
+            {% endif %}
+        </div>
+        {% else %}
+        <div class="box">
+            <h2>Login</h2>
             <div id="login-box" hidden>
                 <input id="email" type="email" placeholder="Email">
                 <input id="password" type="password" placeholder="Password">
@@ -21,8 +85,27 @@
                 <button id="signup" type="button">Sign Up</button>
             </div>
             <button id="sign-out" type="button" hidden>Sign Out</button>
-            {% endif %}
         </div>
+        {% endif %}
     </div>
+
+    <script>
+        const existingFiles = {{ existing_file_names | tojson }};
+        const uploadForm = document.getElementById("upload-form");
+        if (uploadForm) {
+            uploadForm.addEventListener("submit", function (event) {
+                const uploadInput = document.getElementById("upload");
+                const overwriteInput = document.getElementById("overwrite");
+                overwriteInput.value = "0";
+                if (!uploadInput || !uploadInput.files || uploadInput.files.length === 0) return;
+                const selectedName = uploadInput.files[0].name;
+                if (existingFiles.includes(selectedName)) {
+                    const confirmed = window.confirm("This file exists. Overwrite?");
+                    if (!confirmed) { event.preventDefault(); return; }
+                    overwriteInput.value = "1";
+                }
+            });
+        }
+    </script>
 </body>
 </html>
