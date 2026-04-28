@@ -240,7 +240,7 @@ async def uploadFile(request: Request,
         {"owner_user_id": user["user_id"], "directory_id": current["_id"], "name": filename}
     )
     if existing is not None and overwrite != "1":
-        return goHome(current_directory_id, error="That filename already exists. Confirm overwrite.")
+        return goHome(current_directory_id, error="This filename already exists. Confirm overwrite and try again.")
 
     content = await upload.read()
     blob_name = f"{user['user_id']}/{current['_id']}/{filename}"
