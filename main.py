@@ -2,11 +2,11 @@ import os
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 
-from azure.core.exceptions import ResourceExistsError
+from azure.core.exceptions import ResourceExistsError, ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient, ContentSettings
 from bson import ObjectId
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from google.auth.transport.requests import Request as FirebaseRequestAdapter
@@ -43,6 +43,12 @@ firebaseRequestAdapter = FirebaseRequestAdapter()
 # ---------- small helpers ----------
 def utcNow():
     return datetime.now(timezone.utc)
+
+
+def formatTimestamp(value):
+    if value is None:
+        return "-"
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def formatSize(size):
@@ -93,6 +99,7 @@ files.create_index(
     [("owner_user_id", ASCENDING), ("directory_id", ASCENDING), ("name", ASCENDING)],
     unique=True,
 )
+files.create_index([("shared_with_user_ids", ASCENDING)])
 
 
 # ---------- Azurite blob ----------
@@ -119,6 +126,9 @@ def getUser(user_token):
 
     user = users.find_one({"user_id": fb_uid})
     if user is not None:
+        if email and user.get("email") != email:
+            users.update_one({"_id": user["_id"]}, {"$set": {"email": email}})
+            user["email"] = email
         return user
 
     now = utcNow()
@@ -149,10 +159,25 @@ def getCurrentDirectory(user, directory_id_text):
     return target or root
 
 
+def buildBreadcrumbs(current):
+    crumbs = []
+    node = current
+    while node is not None:
+        crumbs.append({"id": str(node["_id"]), "name": node["name"]})
+        if node.get("parent_directory_id") is None:
+            break
+        node = directories.find_one({"_id": node["parent_directory_id"]})
+    crumbs.reverse()
+    if crumbs:
+        crumbs[0]["name"] = "/"
+    return crumbs
+
+
 def buildContext(request, user_token=None, user=None, current=None, message=None, error=None):
     ctx = {
-        "request": request, "user_token": user_token,
+        "request": request, "user_token": user_token, "user_info": None,
         "current_directory": None, "directories": [], "files": [],
+        "breadcrumbs": [], "parent_directory": None,
         "existing_file_names": [],
         "message": message, "error": error,
     }
@@ -164,18 +189,39 @@ def buildContext(request, user_token=None, user=None, current=None, message=None
     cur_files = list(files.find(
         {"owner_user_id": user["user_id"], "directory_id": current["_id"]}
     ).sort("name", ASCENDING))
+
+    parent = None
+    if current.get("parent_directory_id") is not None:
+        parent = directories.find_one(
+            {"_id": current["parent_directory_id"], "owner_user_id": user["user_id"]}
+        )
+
+    ctx["user_info"] = {"email": user.get("email") or "", "root_directory_id": str(user["root_directory_id"])}
     ctx["current_directory"] = {
         "id": str(current["_id"]), "name": current["name"], "path": current["path"],
+        "created_at": formatTimestamp(current.get("created_at")),
     }
     ctx["directories"] = [
         {"id": str(d["_id"]), "name": d["name"], "path": d["path"]} for d in sub_dirs
     ]
     ctx["files"] = [{
         "id": str(f["_id"]), "name": f["name"], "size": formatSize(f.get("size")),
+        "content_type": f.get("content_type") or "application/octet-stream",
+        "updated_at": formatTimestamp(f.get("updated_at")),
+        "shared_with": f.get("shared_with_emails", []),
     } for f in cur_files]
+    ctx["breadcrumbs"] = buildBreadcrumbs(current)
+    ctx["parent_directory"] = (
+        {"id": str(parent["_id"]), "name": parent["name"], "path": parent["path"]}
+        if parent else None
+    )
     ctx["existing_file_names"] = [f["name"] for f in cur_files]
     return ctx
 
+
+# ============================================================
+# routes
+# ============================================================
 
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request):
@@ -217,6 +263,36 @@ async def createDirectory(request: Request,
     except DuplicateKeyError:
         return goHome(current_directory_id, error="A directory with that name already exists here.")
     return goHome(current_directory_id, message=f"Directory '{name}' created.")
+
+
+@app.post("/delete-directory")
+async def deleteDirectory(request: Request,
+                          directory_id: str = Form(...),
+                          current_directory_id: str = Form(...)):
+    token = validateFirebaseToken(request)
+    if token is None:
+        return goHome(error="Please sign in before deleting a directory.")
+    user = getUser(token)
+    target = directories.find_one(
+        {"_id": parseObjectId(directory_id), "owner_user_id": user["user_id"]}
+    )
+    if target is None:
+        return goHome(current_directory_id, error="The directory was not found.")
+    if target["_id"] == user["root_directory_id"]:
+        return goHome(current_directory_id, error="The root directory cannot be deleted.")
+    has_child_dir = directories.find_one(
+        {"owner_user_id": user["user_id"], "parent_directory_id": target["_id"]}
+    )
+    has_child_file = files.find_one(
+        {"owner_user_id": user["user_id"], "directory_id": target["_id"]}
+    )
+    if has_child_dir or has_child_file:
+        return goHome(current_directory_id, error="You can only delete an empty directory.")
+    directories.delete_one({"_id": target["_id"], "owner_user_id": user["user_id"]})
+    redirect_id = current_directory_id
+    if directory_id == current_directory_id:
+        redirect_id = str(target.get("parent_directory_id") or user["root_directory_id"])
+    return goHome(redirect_id, message=f"Directory '{target['name']}' deleted.")
 
 
 @app.post("/upload-file")
@@ -264,7 +340,99 @@ async def uploadFile(request: Request,
         "updated_at": utcNow(),
     }
     if existing is None:
-        files.insert_one({**fields, "created_at": utcNow()})
+        files.insert_one({**fields, "created_at": utcNow(),
+                          "shared_with_user_ids": [], "shared_with_emails": []})
         return goHome(current_directory_id, message=f"Uploaded '{filename}'.")
     files.update_one({"_id": existing["_id"]}, {"$set": fields})
     return goHome(current_directory_id, message=f"Overwrote '{filename}'.")
+
+
+@app.post("/delete-file")
+async def deleteFile(request: Request,
+                     file_id: str = Form(...),
+                     current_directory_id: str = Form(...)):
+    token = validateFirebaseToken(request)
+    if token is None:
+        return goHome(error="Please sign in before deleting files.")
+    user = getUser(token)
+    file_doc = files.find_one(
+        {"_id": parseObjectId(file_id), "owner_user_id": user["user_id"]}
+    )
+    if file_doc is None:
+        return goHome(current_directory_id, error="The file was not found.")
+    try:
+        container.get_blob_client(file_doc["blob_name"]).delete_blob()
+    except ResourceNotFoundError:
+        pass
+    files.delete_one({"_id": file_doc["_id"], "owner_user_id": user["user_id"]})
+    return goHome(current_directory_id, message=f"Deleted '{file_doc['name']}'.")
+
+
+@app.get("/download-file/{file_id}")
+async def downloadFile(request: Request, file_id: str):
+    token = validateFirebaseToken(request)
+    if token is None:
+        return goHome(error="Please sign in before downloading files.")
+    user = getUser(token)
+    file_doc = files.find_one({"_id": parseObjectId(file_id)})
+    if file_doc is None:
+        return goHome(error="The requested file was not found.")
+    is_owner = file_doc.get("owner_user_id") == user["user_id"]
+    is_shared = user["user_id"] in file_doc.get("shared_with_user_ids", [])
+    if not (is_owner or is_shared):
+        return goHome(error="You do not have access to that file.")
+    try:
+        stream = container.get_blob_client(file_doc["blob_name"]).download_blob()
+    except ResourceNotFoundError:
+        return goHome(error="The requested blob could not be found.")
+    headers = {"Content-Disposition": f'attachment; filename="{file_doc["name"]}"'}
+    return StreamingResponse(
+        stream.chunks(),
+        media_type=file_doc.get("content_type") or "application/octet-stream",
+        headers=headers,
+    )
+
+
+@app.post("/share-file")
+async def shareFile(request: Request,
+                    file_id: str = Form(...),
+                    current_directory_id: str = Form(...),
+                    share_emails: str = Form(...)):
+    token = validateFirebaseToken(request)
+    if token is None:
+        return goHome(error="Please sign in before sharing files.")
+    user = getUser(token)
+    file_doc = files.find_one(
+        {"_id": parseObjectId(file_id), "owner_user_id": user["user_id"]}
+    )
+    if file_doc is None:
+        return goHome(current_directory_id, error="The file was not found.")
+    targets = sorted({e.strip().lower() for e in share_emails.split(",") if e.strip()})
+    if not targets:
+        return goHome(current_directory_id, error="Enter at least one email address.")
+
+    shared_ids = set(file_doc.get("shared_with_user_ids", []))
+    shared_emails_set = set(file_doc.get("shared_with_emails", []))
+    missing, added = [], 0
+    own_email = (user.get("email") or "").lower()
+    for email in targets:
+        if email == own_email:
+            continue
+        target_user = users.find_one({"email": email})
+        if target_user is None:
+            missing.append(email)
+            continue
+        if target_user["user_id"] not in shared_ids:
+            added += 1
+        shared_ids.add(target_user["user_id"])
+        shared_emails_set.add(target_user["email"])
+
+    files.update_one({"_id": file_doc["_id"]}, {"$set": {
+        "shared_with_user_ids": sorted(shared_ids),
+        "shared_with_emails": sorted(shared_emails_set),
+        "updated_at": utcNow(),
+    }})
+    err_msg = "These emails do not have accounts yet: " + ", ".join(missing) if missing else None
+    msg = (f"Shared '{file_doc['name']}' with {added} account(s)." if added
+           else f"No new shares were added for '{file_doc['name']}'.")
+    return goHome(current_directory_id, message=msg, error=err_msg)

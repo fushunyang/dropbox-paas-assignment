@@ -19,11 +19,24 @@
         <div class="box success"><p>{{ message }}</p></div>
         {% endif %}
 
-        {% if user_token %}
+        {% if user_info %}
         <div class="box">
             <h2>User</h2>
-            <p>Current directory: {{ current_directory.path }}</p>
+            <p><strong>Email:</strong> {{ user_info.email }}</p>
+            <p><strong>Current directory:</strong> {{ current_directory.path }}</p>
             <button id="sign-out" type="button">Sign Out</button>
+        </div>
+
+        <div class="box">
+            <h2>Navigation</h2>
+            <p>
+                {% for crumb in breadcrumbs %}
+                <a href="/?directory_id={{ crumb.id }}">{{ crumb.name }}</a>{% if not loop.last %} / {% endif %}
+                {% endfor %}
+            </p>
+            {% if parent_directory %}
+            <p><a href="/?directory_id={{ parent_directory.id }}">../</a></p>
+            {% endif %}
         </div>
 
         <div class="box">
@@ -52,7 +65,15 @@
                 {% for directory in directories %}
                 <li>
                     <p><strong>{{ directory.name }}/</strong></p>
-                    <a href="/?directory_id={{ directory.id }}">Open</a>
+                    <p class="small-text">{{ directory.path }}</p>
+                    <div class="button-row">
+                        <a href="/?directory_id={{ directory.id }}">Open</a>
+                        <form action="/delete-directory" method="post">
+                            <input type="hidden" name="directory_id" value="{{ directory.id }}">
+                            <input type="hidden" name="current_directory_id" value="{{ current_directory.id }}">
+                            <button type="submit">Delete</button>
+                        </form>
+                    </div>
                 </li>
                 {% endfor %}
             </ul>
@@ -67,7 +88,25 @@
             <ul class="simple-list">
                 {% for file in files %}
                 <li>
-                    <p><strong>{{ file.name }}</strong> ({{ file.size }})</p>
+                    <p><strong>{{ file.name }}</strong></p>
+                    <p class="small-text">{{ file.size }} | {{ file.content_type }}</p>
+                    {% if file.shared_with %}
+                    <p class="small-text">Shared with: {{ file.shared_with | join(", ") }}</p>
+                    {% endif %}
+                    <div class="button-row">
+                        <a href="/download-file/{{ file.id }}">Download</a>
+                        <form action="/delete-file" method="post">
+                            <input type="hidden" name="file_id" value="{{ file.id }}">
+                            <input type="hidden" name="current_directory_id" value="{{ current_directory.id }}">
+                            <button type="submit">Delete</button>
+                        </form>
+                    </div>
+                    <form action="/share-file" method="post">
+                        <input type="hidden" name="file_id" value="{{ file.id }}">
+                        <input type="hidden" name="current_directory_id" value="{{ current_directory.id }}">
+                        <input type="text" name="share_emails" placeholder="email1, email2">
+                        <button type="submit">Share File</button>
+                    </form>
                 </li>
                 {% endfor %}
             </ul>
@@ -100,7 +139,7 @@
                 if (!uploadInput || !uploadInput.files || uploadInput.files.length === 0) return;
                 const selectedName = uploadInput.files[0].name;
                 if (existingFiles.includes(selectedName)) {
-                    const confirmed = window.confirm("This file exists. Overwrite?");
+                    const confirmed = window.confirm("A file with this name already exists. Overwrite it?");
                     if (!confirmed) { event.preventDefault(); return; }
                     overwriteInput.value = "1";
                 }
