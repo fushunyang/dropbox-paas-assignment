@@ -68,6 +68,16 @@ a {
     color: #0b57a4;
 }
 
+.small-text {
+    color: #555555;
+    font-size: 0.95rem;
+}
+
+.duplicate {
+    background-color: #fff8d6;
+    border-color: #d7c36a;
+}
+
 .error {
     background-color: #ffeaea;
 }

@@ -1,4 +1,6 @@
+import hashlib
 import os
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 
@@ -177,8 +179,8 @@ def buildContext(request, user_token=None, user=None, current=None, message=None
     ctx = {
         "request": request, "user_token": user_token, "user_info": None,
         "current_directory": None, "directories": [], "files": [],
-        "breadcrumbs": [], "parent_directory": None,
-        "existing_file_names": [],
+        "breadcrumbs": [], "parent_directory": None, "duplicate_groups": [],
+        "shared_files": [], "existing_file_names": [],
         "message": message, "error": error,
     }
     if user is None or current is None:
@@ -190,11 +192,58 @@ def buildContext(request, user_token=None, user=None, current=None, message=None
         {"owner_user_id": user["user_id"], "directory_id": current["_id"]}
     ).sort("name", ASCENDING))
 
+    counts = Counter(f.get("sha256") for f in cur_files if f.get("sha256"))
+    dup_in_dir = {h for h, c in counts.items() if c > 1}
+
     parent = None
     if current.get("parent_directory_id") is not None:
         parent = directories.find_one(
             {"_id": current["parent_directory_id"], "owner_user_id": user["user_id"]}
         )
+
+    file_views = []
+    for f in cur_files:
+        sha = f.get("sha256") or ""
+        path = f.get("directory_path") or "/"
+        full = f"/{f['name']}" if path == "/" else f"{path}/{f['name']}"
+        file_views.append({
+            "id": str(f["_id"]), "name": f["name"], "size": formatSize(f.get("size")),
+            "content_type": f.get("content_type") or "application/octet-stream",
+            "sha256": sha, "sha256_short": sha[:12] if sha else "-",
+            "updated_at": formatTimestamp(f.get("updated_at")),
+            "full_path": full, "shared_with": f.get("shared_with_emails", []),
+            "is_duplicate_current": sha in dup_in_dir,
+        })
+
+    all_files = list(files.find({"owner_user_id": user["user_id"]}))
+    grouped = defaultdict(list)
+    for f in all_files:
+        if f.get("sha256"):
+            grouped[f["sha256"]].append(f)
+    dup_groups = []
+    for sha, group in grouped.items():
+        if len(group) < 2:
+            continue
+        dup_groups.append({"sha256": sha, "files": [
+            {"id": str(g["_id"]), "name": g["name"],
+             "full_path": ((g.get("directory_path") or "/") + "/" + g["name"]).replace("//", "/"),
+             "size": formatSize(g.get("size"))}
+            for g in sorted(group, key=lambda x: x["name"])
+        ]})
+    dup_groups.sort(key=lambda g: (-len(g["files"]), g["sha256"]))
+
+    shared_docs = list(files.find({"shared_with_user_ids": user["user_id"]}).sort("name", ASCENDING))
+    owner_emails = {}
+    if shared_docs:
+        owner_ids = {d["owner_user_id"] for d in shared_docs}
+        for u in users.find({"user_id": {"$in": list(owner_ids)}}):
+            owner_emails[u["user_id"]] = u.get("email") or u["user_id"]
+    shared_files = [{
+        "id": str(d["_id"]), "name": d["name"],
+        "owner": owner_emails.get(d["owner_user_id"], d["owner_user_id"]),
+        "full_path": ((d.get("directory_path") or "/") + "/" + d["name"]).replace("//", "/"),
+        "size": formatSize(d.get("size")),
+    } for d in shared_docs]
 
     ctx["user_info"] = {"email": user.get("email") or "", "root_directory_id": str(user["root_directory_id"])}
     ctx["current_directory"] = {
@@ -204,17 +253,14 @@ def buildContext(request, user_token=None, user=None, current=None, message=None
     ctx["directories"] = [
         {"id": str(d["_id"]), "name": d["name"], "path": d["path"]} for d in sub_dirs
     ]
-    ctx["files"] = [{
-        "id": str(f["_id"]), "name": f["name"], "size": formatSize(f.get("size")),
-        "content_type": f.get("content_type") or "application/octet-stream",
-        "updated_at": formatTimestamp(f.get("updated_at")),
-        "shared_with": f.get("shared_with_emails", []),
-    } for f in cur_files]
+    ctx["files"] = file_views
     ctx["breadcrumbs"] = buildBreadcrumbs(current)
     ctx["parent_directory"] = (
         {"id": str(parent["_id"]), "name": parent["name"], "path": parent["path"]}
         if parent else None
     )
+    ctx["duplicate_groups"] = dup_groups
+    ctx["shared_files"] = shared_files
     ctx["existing_file_names"] = [f["name"] for f in cur_files]
     return ctx
 
@@ -319,6 +365,7 @@ async def uploadFile(request: Request,
         return goHome(current_directory_id, error="This filename already exists. Confirm overwrite and try again.")
 
     content = await upload.read()
+    sha = hashlib.sha256(content).hexdigest()
     blob_name = f"{user['user_id']}/{current['_id']}/{filename}"
     try:
         try:
@@ -337,7 +384,7 @@ async def uploadFile(request: Request,
         "directory_id": current["_id"], "directory_path": current["path"],
         "blob_name": blob_name, "size": len(content),
         "content_type": upload.content_type or "application/octet-stream",
-        "updated_at": utcNow(),
+        "sha256": sha, "updated_at": utcNow(),
     }
     if existing is None:
         files.insert_one({**fields, "created_at": utcNow(),

@@ -87,9 +87,13 @@
             {% if files %}
             <ul class="simple-list">
                 {% for file in files %}
-                <li>
+                <li class="{% if file.is_duplicate_current %}duplicate{% endif %}">
                     <p><strong>{{ file.name }}</strong></p>
-                    <p class="small-text">{{ file.size }} | {{ file.content_type }}</p>
+                    <p class="small-text">{{ file.full_path }}</p>
+                    <p class="small-text">{{ file.size }} | {{ file.content_type }} | {{ file.sha256_short }}</p>
+                    {% if file.is_duplicate_current %}
+                    <p class="small-text">Duplicate found in this directory.</p>
+                    {% endif %}
                     {% if file.shared_with %}
                     <p class="small-text">Shared with: {{ file.shared_with | join(", ") }}</p>
                     {% endif %}
@@ -112,6 +116,45 @@
             </ul>
             {% else %}
             <p>No files in this location.</p>
+            {% endif %}
+        </div>
+
+        <div class="box">
+            <h2>Duplicate Files In This Account</h2>
+            {% if duplicate_groups %}
+            <ul class="simple-list">
+                {% for group in duplicate_groups %}
+                <li>
+                    <p><strong>{{ group.sha256[:16] }}...</strong></p>
+                    <ul>
+                        {% for file in group.files %}
+                        <li>{{ file.full_path }} ({{ file.size }})</li>
+                        {% endfor %}
+                    </ul>
+                </li>
+                {% endfor %}
+            </ul>
+            {% else %}
+            <p>No duplicates found across this account.</p>
+            {% endif %}
+        </div>
+
+        <div class="box">
+            <h2>Shared With Me</h2>
+            {% if shared_files %}
+            <ul class="simple-list">
+                {% for file in shared_files %}
+                <li>
+                    <p><strong>{{ file.name }}</strong></p>
+                    <p class="small-text">Owner: {{ file.owner }}</p>
+                    <p class="small-text">{{ file.full_path }}</p>
+                    <p class="small-text">{{ file.size }}</p>
+                    <a href="/download-file/{{ file.id }}">Download</a>
+                </li>
+                {% endfor %}
+            </ul>
+            {% else %}
+            <p>No shared files.</p>
             {% endif %}
         </div>
         {% else %}
