@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 jinja2
-google-auth
 pymongo
+google-auth
 azure-storage-blob
 python-multipart
