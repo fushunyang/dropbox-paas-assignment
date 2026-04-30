@@ -19,7 +19,9 @@ body {
     margin-bottom: 18px;
 }
 
-h1, h2, p {
+h1,
+h2,
+p {
     margin-top: 0;
 }
 
@@ -43,6 +45,10 @@ h1, h2, p {
     align-items: center;
     flex-wrap: wrap;
     margin: 8px 0;
+}
+
+.center-row {
+    justify-content: center;
 }
 
 form {
@@ -76,6 +82,10 @@ a {
 .duplicate {
     background-color: #fff8d6;
     border-color: #d7c36a;
+}
+
+.warning {
+    background-color: #fff6de;
 }
 
 .error {

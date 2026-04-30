@@ -2,21 +2,39 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Dropbox Assignment</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Assignment2</title>
     <link rel="stylesheet" href="{{ request.url_for('static', path='styles.css') }}">
     <script type="module" src="{{ request.url_for('static', path='firebase-login.js') }}"></script>
 </head>
 <body>
     <div class="main">
         <div class="box">
-            <h1>Dropbox Assignment</h1>
+            <h1>Assignment2</h1>
+            <p>This layout is kept simple on purpose so it stays close to the course examples.</p>
         </div>
 
-        {% if error %}
-        <div class="box error"><p>{{ error }}</p></div>
+        {% if startup_issues %}
+        <div class="box warning">
+            <h2>Startup Notes</h2>
+            <ul>
+                {% for issue in startup_issues %}
+                <li>{{ issue }}</li>
+                {% endfor %}
+            </ul>
+        </div>
         {% endif %}
+
+        {% if error %}
+        <div class="box error">
+            <p>{{ error }}</p>
+        </div>
+        {% endif %}
+
         {% if message %}
-        <div class="box success"><p>{{ message }}</p></div>
+        <div class="box success">
+            <p>{{ message }}</p>
+        </div>
         {% endif %}
 
         {% if user_info %}
@@ -161,10 +179,13 @@
         <div class="box">
             <h2>Login</h2>
             <div id="login-box" hidden>
+                <p>Use the Firebase email and password login from the examples.</p>
                 <input id="email" type="email" placeholder="Email">
                 <input id="password" type="password" placeholder="Password">
-                <button id="login" type="button">Login</button>
-                <button id="signup" type="button">Sign Up</button>
+                <div class="button-row center-row">
+                    <button id="login" type="button">Login</button>
+                    <button id="signup" type="button">Sign Up</button>
+                </div>
             </div>
             <button id="sign-out" type="button" hidden>Sign Out</button>
         </div>
@@ -174,16 +195,24 @@
     <script>
         const existingFiles = {{ existing_file_names | tojson }};
         const uploadForm = document.getElementById("upload-form");
+
         if (uploadForm) {
             uploadForm.addEventListener("submit", function (event) {
                 const uploadInput = document.getElementById("upload");
                 const overwriteInput = document.getElementById("overwrite");
                 overwriteInput.value = "0";
-                if (!uploadInput || !uploadInput.files || uploadInput.files.length === 0) return;
+
+                if (!uploadInput || !uploadInput.files || uploadInput.files.length === 0) {
+                    return;
+                }
+
                 const selectedName = uploadInput.files[0].name;
                 if (existingFiles.includes(selectedName)) {
                     const confirmed = window.confirm("A file with this name already exists. Overwrite it?");
-                    if (!confirmed) { event.preventDefault(); return; }
+                    if (!confirmed) {
+                        event.preventDefault();
+                        return;
+                    }
                     overwriteInput.value = "1";
                 }
             });

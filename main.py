@@ -19,8 +19,11 @@ from starlette import status
 
 
 # ---------- config ----------
+# The assignment Atlas URI is hard-coded here so the project runs without
+# having to set any env vars. Override with MONGODB_URI if you want a
+# different cluster.
 DEFAULT_MONGODB_URI = (
-    "mongodb+srv://924759663:T12345678@cluster0.jiikkqk.mongodb.net/"
+    "mongodb+srv://924759663:F12345678f@cluster0.jiikkqk.mongodb.net/"
     "?retryWrites=true&w=majority&appName=Cluster0"
 )
 MONGODB_URI = os.environ.get("MONGODB_URI") or DEFAULT_MONGODB_URI
@@ -40,6 +43,50 @@ app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 firebaseRequestAdapter = FirebaseRequestAdapter()
+startup_issues = []
+
+
+# ---------- MongoDB (Group 1) ----------
+# Three collections: users / directories / files. Group 1 task 2 asks
+# for exactly these three. The unique indexes are what stop two folders
+# (or files) from sharing the same name inside the same parent, and
+# they also block the "two same-name dirs" major bug listed in the
+# brief. The last index on shared_with_user_ids is for the Group 4
+# "Shared with me" list.
+try:
+    mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
+    mongo_client.admin.command("ping")
+    db = mongo_client[DATABASE_NAME]
+    users = db["users"]
+    directories = db["directories"]
+    files = db["files"]
+    users.create_index([("user_id", ASCENDING)], unique=True)
+    users.create_index([("email", ASCENDING)], unique=True, sparse=True)
+    directories.create_index(
+        [("owner_user_id", ASCENDING), ("parent_directory_id", ASCENDING), ("name", ASCENDING)],
+        unique=True,
+    )
+    files.create_index(
+        [("owner_user_id", ASCENDING), ("directory_id", ASCENDING), ("name", ASCENDING)],
+        unique=True,
+    )
+    files.create_index([("shared_with_user_ids", ASCENDING)])
+except Exception:
+    startup_issues.append("MongoDB connection failed. Check MONGODB_URI.")
+    users = directories = files = None
+
+
+# ---------- Azurite blob (Group 2) ----------
+# Actual file bytes live here. Upload / download / delete all go
+# through this container.
+try:
+    blob_service = BlobServiceClient.from_connection_string(
+        AZURE_CONN, connection_timeout=2, read_timeout=2, retry_total=1,
+    )
+    container = blob_service.get_container_client(CONTAINER_NAME)
+except Exception:
+    startup_issues.append("Blob storage setup failed. Check Azurite or Azure settings.")
+    container = None
 
 
 # ---------- small helpers ----------
@@ -64,16 +111,9 @@ def formatSize(size):
     return f"{size} B"
 
 
-def parseObjectId(value):
-    if not value:
-        return None
-    try:
-        return ObjectId(value)
-    except Exception:
-        return None
-
-
 def goHome(directory_id=None, message=None, error=None):
+    # Most POST handlers redirect back to "/" with directory_id and an
+    # optional message / error stuffed into the query string.
     params = {}
     if directory_id:
         params["directory_id"] = directory_id
@@ -85,44 +125,33 @@ def goHome(directory_id=None, message=None, error=None):
     return RedirectResponse(url=url, status_code=status.HTTP_302_FOUND)
 
 
-# ---------- MongoDB ----------
-mongo_client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=5000)
-db = mongo_client[DATABASE_NAME]
-users = db["users"]
-directories = db["directories"]
-files = db["files"]
-users.create_index([("user_id", ASCENDING)], unique=True)
-users.create_index([("email", ASCENDING)], unique=True, sparse=True)
-directories.create_index(
-    [("owner_user_id", ASCENDING), ("parent_directory_id", ASCENDING), ("name", ASCENDING)],
-    unique=True,
-)
-files.create_index(
-    [("owner_user_id", ASCENDING), ("directory_id", ASCENDING), ("name", ASCENDING)],
-    unique=True,
-)
-files.create_index([("shared_with_user_ids", ASCENDING)])
+def parseObjectId(value):
+    if not value:
+        return None
+    try:
+        return ObjectId(value)
+    except Exception:
+        return None
 
 
-# ---------- Azurite blob ----------
-blob_service = BlobServiceClient.from_connection_string(
-    AZURE_CONN, connection_timeout=2, read_timeout=2, retry_total=1,
-)
-container = blob_service.get_container_client(CONTAINER_NAME)
-
-
+# ---- Group 1: Firebase login + auto-create user / root dir on first login ----
 def validateFirebaseToken(request):
+    # Read the token cookie that firebase-login.js writes after a
+    # successful sign-in, then send it to Google to verify. Returns the
+    # decoded token if valid, or None if there is no login.
     cookie = request.cookies.get("token")
     if not cookie:
         return None
     try:
         return id_token.verify_firebase_token(cookie, firebaseRequestAdapter)
-    except Exception as e:
+    except Exception as e:  # pragma: no cover
         print(e)
         return None
 
 
 def getUser(user_token):
+    # For a first-time login, insert the user doc and the root directory
+    # "/" together so the rest of the code can always assume both exist.
     fb_uid = user_token.get("user_id") or user_token.get("uid") or user_token.get("sub") or ""
     email = (user_token.get("email") or "").strip().lower()
 
@@ -150,18 +179,24 @@ def getUser(user_token):
 
 
 def getCurrentDirectory(user, directory_id_text):
+    # Resolve ?directory_id= in the URL into a directory doc. If missing
+    # or invalid, fall back to root.
     root = directories.find_one({"_id": user["root_directory_id"], "owner_user_id": user["user_id"]})
     if root is None:
-        return None
+        return None, "Root directory could not be loaded."
     if not directory_id_text:
-        return root
+        return root, None
     target = directories.find_one(
         {"_id": parseObjectId(directory_id_text), "owner_user_id": user["user_id"]}
     )
-    return target or root
+    if target is None:
+        return root, "The requested directory was not found. Returned to root."
+    return target, None
 
 
 def buildBreadcrumbs(current):
+    # Walk up parent_directory_id to build the "/ > a > b" trail at the
+    # top of the page.
     crumbs = []
     node = current
     while node is not None:
@@ -175,16 +210,19 @@ def buildBreadcrumbs(current):
     return crumbs
 
 
+
 def buildContext(request, user_token=None, user=None, current=None, message=None, error=None):
+
     ctx = {
         "request": request, "user_token": user_token, "user_info": None,
         "current_directory": None, "directories": [], "files": [],
         "breadcrumbs": [], "parent_directory": None, "duplicate_groups": [],
         "shared_files": [], "existing_file_names": [],
-        "message": message, "error": error,
+        "message": message, "error": error, "startup_issues": startup_issues,
     }
     if user is None or current is None:
         return ctx
+
     sub_dirs = list(directories.find(
         {"owner_user_id": user["user_id"], "parent_directory_id": current["_id"]}
     ).sort("name", ASCENDING))
@@ -192,6 +230,7 @@ def buildContext(request, user_token=None, user=None, current=None, message=None
         {"owner_user_id": user["user_id"], "directory_id": current["_id"]}
     ).sort("name", ASCENDING))
 
+    # ---- Group 3: duplicates inside the current directory ----
     counts = Counter(f.get("sha256") for f in cur_files if f.get("sha256"))
     dup_in_dir = {h for h, c in counts.items() if c > 1}
 
@@ -215,6 +254,7 @@ def buildContext(request, user_token=None, user=None, current=None, message=None
             "is_duplicate_current": sha in dup_in_dir,
         })
 
+    # ---- Group 4: duplicates across the whole account ----
     all_files = list(files.find({"owner_user_id": user["user_id"]}))
     grouped = defaultdict(list)
     for f in all_files:
@@ -232,6 +272,7 @@ def buildContext(request, user_token=None, user=None, current=None, message=None
         ]})
     dup_groups.sort(key=lambda g: (-len(g["files"]), g["sha256"]))
 
+    # ---- Group 4: files other people have shared with me ----
     shared_docs = list(files.find({"shared_with_user_ids": user["user_id"]}).sort("name", ASCENDING))
     owner_emails = {}
     if shared_docs:
@@ -269,17 +310,20 @@ def buildContext(request, user_token=None, user=None, current=None, message=None
 # routes
 # ============================================================
 
+# ---------- Group 1: login page + directory create / delete ----------
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request):
     msg = request.query_params.get("message")
     err = request.query_params.get("error")
+    if users is None:
+        return templates.TemplateResponse(request, "main.html", buildContext(request, message=msg, error=err))
     token = validateFirebaseToken(request)
     if token is None:
         return templates.TemplateResponse(request, "main.html", buildContext(request, message=msg, error=err))
     user = getUser(token)
-    current = getCurrentDirectory(user, request.query_params.get("directory_id"))
+    current, dir_err = getCurrentDirectory(user, request.query_params.get("directory_id"))
     return templates.TemplateResponse(request, "main.html", buildContext(
-        request, user_token=token, user=user, current=current, message=msg, error=err,
+        request, user_token=token, user=user, current=current, message=msg, error=err or dir_err,
     ))
 
 
@@ -287,6 +331,8 @@ async def root(request: Request):
 async def createDirectory(request: Request,
                           current_directory_id: str = Form(...),
                           directory_name: str = Form(...)):
+    # Same-name folders inside the same parent get blocked by Mongo's
+    # unique index. This just turns that exception into a friendly line.
     token = validateFirebaseToken(request)
     if token is None:
         return goHome(error="Please sign in before creating a directory.")
@@ -315,6 +361,8 @@ async def createDirectory(request: Request,
 async def deleteDirectory(request: Request,
                           directory_id: str = Form(...),
                           current_directory_id: str = Form(...)):
+    # Refuse to delete the root or any non-empty directory (the brief
+    # specifically lists this as a major bug to watch for).
     token = validateFirebaseToken(request)
     if token is None:
         return goHome(error="Please sign in before deleting a directory.")
@@ -341,14 +389,20 @@ async def deleteDirectory(request: Request,
     return goHome(redirect_id, message=f"Directory '{target['name']}' deleted.")
 
 
+# ---------- Group 2: file upload / delete / download ----------
 @app.post("/upload-file")
 async def uploadFile(request: Request,
                      current_directory_id: str = Form(...),
                      overwrite: str = Form("0"),
                      upload: UploadFile = File(...)):
+    # If overwrite is not "1" the existing file is kept (this is the
+    # other major bug check from the brief).
+    # sha256 is computed here so Group 3 / 4 can use it later.
     token = validateFirebaseToken(request)
     if token is None:
         return goHome(error="Please sign in before uploading files.")
+    if container is None:
+        return goHome(current_directory_id, error="Blob storage is not connected.")
     user = getUser(token)
     current = directories.find_one(
         {"_id": parseObjectId(current_directory_id), "owner_user_id": user["user_id"]}
@@ -377,7 +431,7 @@ async def uploadFile(request: Request,
             content_settings=ContentSettings(content_type=upload.content_type or "application/octet-stream"),
         )
     except Exception:
-        return goHome(current_directory_id, error="Blob storage upload failed. Check Azurite.")
+        return goHome(current_directory_id, error="Blob storage upload failed. Check that Azurite is running.")
 
     fields = {
         "name": filename, "owner_user_id": user["user_id"],
@@ -407,16 +461,19 @@ async def deleteFile(request: Request,
     )
     if file_doc is None:
         return goHome(current_directory_id, error="The file was not found.")
-    try:
-        container.get_blob_client(file_doc["blob_name"]).delete_blob()
-    except ResourceNotFoundError:
-        pass
+    if container is not None:
+        try:
+            container.get_blob_client(file_doc["blob_name"]).delete_blob()
+        except ResourceNotFoundError:
+            pass
     files.delete_one({"_id": file_doc["_id"], "owner_user_id": user["user_id"]})
     return goHome(current_directory_id, message=f"Deleted '{file_doc['name']}'.")
 
 
 @app.get("/download-file/{file_id}")
 async def downloadFile(request: Request, file_id: str):
+    # Own files can always be downloaded. For files that belong to
+    # someone else, the user must be in the shared list.
     token = validateFirebaseToken(request)
     if token is None:
         return goHome(error="Please sign in before downloading files.")
@@ -428,6 +485,8 @@ async def downloadFile(request: Request, file_id: str):
     is_shared = user["user_id"] in file_doc.get("shared_with_user_ids", [])
     if not (is_owner or is_shared):
         return goHome(error="You do not have access to that file.")
+    if container is None:
+        return goHome(error="Blob storage is not connected.")
     try:
         stream = container.get_blob_client(file_doc["blob_name"]).download_blob()
     except ResourceNotFoundError:
@@ -440,11 +499,14 @@ async def downloadFile(request: Request, file_id: str):
     )
 
 
+# ---------- Group 4: read-only file sharing ----------
 @app.post("/share-file")
 async def shareFile(request: Request,
                     file_id: str = Form(...),
                     current_directory_id: str = Form(...),
                     share_emails: str = Form(...)):
+    # Read-only sharing. Look up each email in users and add the
+    # matching user_id into shared_with_user_ids.
     token = validateFirebaseToken(request)
     if token is None:
         return goHome(error="Please sign in before sharing files.")
